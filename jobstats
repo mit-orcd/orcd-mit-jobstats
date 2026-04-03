@@ -20,6 +20,13 @@ if __name__ == "__main__":
                           encode it in base64 output for db storage.")
     parser.add_argument("-d", "--debug", action='store_true', default=False,
                     help="Output debugging information.")
+    parser.add_argument(
+        "--debug-slurm-env",
+        choices=("primary", "archive", "both"),
+        default=None,
+        metavar="MODE",
+        help="With -d: sacct primary only, archive only (as if job missing in live DB), or both (default).",
+    )
     parser.add_argument("-S", "--syslog", action='store_true', default=False,
                     help="Output debugging information to syslog.")
     parser.add_argument("-f", "--force", action='store_true', default=False,
@@ -27,6 +34,8 @@ if __name__ == "__main__":
     parser.add_argument("-n", "--no-color", action='store_true', default=False,
                     help="Output report without colorization.")
     args = parser.parse_args()
+    if args.debug_slurm_env and not args.debug:
+        parser.error("--debug-slurm-env requires --debug")
 
     for jobid in args.job:
         stats = Jobstats(jobid=jobid,
@@ -34,7 +43,8 @@ if __name__ == "__main__":
                          prom_server=PROM_SERVER,
                          debug=args.debug,
                          debug_syslog=args.syslog,
-                         force_recalc=args.force)
+                         force_recalc=args.force,
+                         debug_slurm_env=args.debug_slurm_env)
         if args.json or args.base64:
             print(stats.report_job_json(args.base64))
         else:

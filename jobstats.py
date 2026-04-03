@@ -51,12 +51,15 @@ class Jobstats:
                  prom_server=None,
                  debug=False,
                  debug_syslog=False,
-                 force_recalc=False):
+                 force_recalc=False,
+                 debug_slurm_env=None):
         self.cluster = cluster
         self.prom_server = prom_server
         self.debug = debug
         self.debug_syslog = debug_syslog
         self.force_recalc = force_recalc
+        # With debug enabled only: narrow which Slurm accounting env sacct uses (see CLI).
+        self.debug_slurm_env = debug_slurm_env if debug else None
         self.sp_node = {}
         self._subprocess_slurm_env = None  # set when archive SLURM_CONF is used for sacct
         # translate cluster name
@@ -158,6 +161,9 @@ class Jobstats:
                 % archive_raw
             )
         self._subprocess_slurm_env = None
+        slurm_mode = self.debug_slurm_env or "both"
+        if slurm_mode not in ("primary", "archive", "both"):
+            slurm_mode = "both"
 
         def fetch_sacct(extra_env=None):
             """Run sacct; return True if JobIDRaw was set from a row."""
@@ -214,17 +220,38 @@ class Jobstats:
                 )
             return self.jobidraw is not None
 
-        got = fetch_sacct()
-        if not got and archive_conf:
-            self.debug_print("sacct: retrying with SLURM_CONF=%s (archive Slurm)" % archive_conf)
+        if slurm_mode == "archive":
+            if not archive_conf:
+                self.error(
+                    "\n--debug-slurm-env archive requires a usable SLURM_ARCHIVE_CONF "
+                    "(path to slurm.conf or a directory containing slurm.conf).\n"
+                )
+            self.debug_print(
+                "sacct: archive Slurm only (--debug-slurm-env archive); skipping primary env"
+            )
             got = fetch_sacct({"SLURM_CONF": archive_conf})
             if got:
                 self._subprocess_slurm_env = {"SLURM_CONF": archive_conf}
+        else:
+            got = fetch_sacct()
+            if not got and archive_conf and slurm_mode != "primary":
+                self.debug_print("sacct: retrying with SLURM_CONF=%s (archive Slurm)" % archive_conf)
+                got = fetch_sacct({"SLURM_CONF": archive_conf})
+                if got:
+                    self._subprocess_slurm_env = {"SLURM_CONF": archive_conf}
+            elif not got and archive_conf and slurm_mode == "primary":
+                self.debug_print("sacct: skipping archive retry (--debug-slurm-env primary)")
 
         if not got:
             msg = (f"\nFailed to lookup job {self.jobid}. Make sure the cluster is correct by\n"
                    "specifying the -c option (e.g., $ jobstats 1234567 -c frontier).\n")
-            if archive_conf is None and not archive_raw:
+            if slurm_mode == "primary":
+                msg += "(Archive Slurm was not tried: --debug-slurm-env primary.)\n"
+            elif slurm_mode == "archive":
+                msg += (
+                    f"(Only archive Slurm was tried, with SLURM_CONF={archive_conf}.)\n"
+                )
+            if archive_conf is None and not archive_raw and slurm_mode != "archive":
                 msg += (
                     "If this is an old job, set SLURM_ARCHIVE_CONF in the jobstats config "
                     "so sacct can use the archived accounting database.\n"
@@ -234,7 +261,7 @@ class Jobstats:
                     f"SLURM_ARCHIVE_CONF is {archive_raw!r} but that path is not a usable "
                     "slurm.conf (or slurm.conf under that directory).\n"
                 )
-            else:
+            elif slurm_mode == "both" and archive_conf is not None:
                 msg += (
                     f"The job was not found with the default Slurm config or with "
                     f"SLURM_CONF={archive_conf}.\n"
