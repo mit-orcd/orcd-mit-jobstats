@@ -35,18 +35,26 @@ jobstats [options] jobid [jobid ...]
 |--------|---------|
 | `-c`, `--cluster` | Slurm cluster name for `sacct -M` when not using the host default. |
 | `-d`, `--debug` | Print debug lines (queries, Slurm fields, archive retry). |
+| `--debug-slurm-env MODE` | **Requires `-d`.** Restricts which Slurm accounting environment `sacct` uses: `primary` (live config only, no archive retry), `archive` (archive `slurm.conf` only, as if the job were missing from the live DB), or `both` (default when this flag is omitted—try primary, then archive). |
 | `-S`, `--syslog` | Log debug to syslog. |
 | `-f`, `--force` | Ignore cached job payload in Slurm admin comment; re-fetch from Prometheus. |
 | `-j`, `--json` | Emit per-node JSON instead of the text report. |
 | `-b`, `--base64` | Same as JSON, gzip-compressed and base64-encoded (for storage). |
 | `-n`, `--no-color` | Disable ANSI colors in the text report. |
 
-Example:
+Examples:
 
 ```bash
 jobstats 12345678
 jobstats -c mycluster 12345678 -d
+
+# Debug Slurm lookup in isolation (archive path comes from SLURM_ARCHIVE_CONF in config.py)
+jobstats -d --debug-slurm-env primary 12345678    # live Slurm only
+jobstats -d --debug-slurm-env archive 12345678    # archived accounting only
+jobstats -d --debug-slurm-env both 12345678       # same as: jobstats -d 12345678
 ```
+
+`--debug-slurm-env` is ignored unless `-d` is set; using it without `-d` is a CLI error.
 
 ## Layout
 
