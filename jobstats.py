@@ -263,8 +263,8 @@ class Jobstats:
                 )
             elif slurm_mode == "both" and archive_conf is not None:
                 msg += (
-                    f"The job was not found with the default Slurm config or with "
-                    f"SLURM_CONF={archive_conf}.\n"
+                    f"The job was not found with the default Slurm config or with archive config.\n"
+                    #f"SLURM_CONF={archive_conf}.\n"
                 )
             if cluster_sacct_arg:
                 clstr = (
