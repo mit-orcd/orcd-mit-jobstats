@@ -1,0 +1,13 @@
+[Unit]
+Description=Auto-deploy jobstats exporters to new Slurm nodes
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/autodeploy_exporters.py
+# Needs root (or a user) able to: run sinfo, write /db/prometheus/targets,
+# ssh via clush to compute nodes and run salt-call.
+User=root
+StateDirectory=exporter-autodeploy
+TimeoutStartSec=30min
