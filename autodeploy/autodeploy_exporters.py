@@ -7,16 +7,21 @@ times daily). On each run it:
 
   1. Discovers all nodes currently known to Slurm (`sinfo`), including
      whether each node has GPUs (gpu GRES).
-  2. Appends any node missing from the Prometheus file_sd target files
-     (cgroup_targets.yml, gpu_targets.yml, node_targets.yml) using the
-     '<node><suffix>:<port>' convention. GPU nodes go into all three
-     files; CPU-only nodes are added to cgroup and node targets only.
-     Files are rewritten atomically and existing content/format is
-     preserved.
-  3. Checks that each pending node is actually ready for deployment:
-     its Slurm state is healthy (not down/drained/maintenance/not
-     responding), it is reachable via ssh, and its load is not too high.
-     Nodes that fail the check are skipped and re-checked next run.
+  2. Checks that each new (not yet deployed) node is ready for
+     deployment:
+       - Slurm state is healthy (not down/drained/maintenance/not
+         responding) - otherwise retried next run;
+       - reachable via ssh and load not too high - otherwise retried
+         next run;
+       - runs a supported OS: RHEL or Rocky, major version >= 8.
+         Nodes on older/other OSes are excluded entirely (no targets,
+         no deployment) until they are reinstalled/upgraded.
+  3. Appends ready nodes missing from the Prometheus file_sd target
+     files (cgroup_targets.yml, gpu_targets.yml, node_targets.yml)
+     using the '<node><suffix>:<port>' convention. GPU nodes go into
+     all three files; CPU-only nodes are added to cgroup and node
+     targets only. Files are rewritten atomically and existing
+     content/format is preserved.
   4. Deploys the exporters (all three on GPU nodes, cgroup + node on
      CPU-only nodes) to ready nodes that have not yet been successfully
      deployed, via:
@@ -64,6 +69,11 @@ CLUSH_OPTS = ["-o", "-oConnectTimeout=3"]
 # Skip deployment to a node if its 1-min load average exceeds
 # (number of CPUs * MAX_LOAD_RATIO). Overridable with --max-load-ratio.
 MAX_LOAD_RATIO = 1.0
+
+# Only deploy to these OSes (/etc/os-release ID) at or above this
+# major version. Anything else is excluded from targets and deployment.
+ALLOWED_OS_IDS = {"rhel", "rocky"}
+MIN_OS_MAJOR = 8
 
 # Slurm node states (sinfo %t) that mean "don't touch this node now".
 UNAVAILABLE_STATE_RE = re.compile(
@@ -130,31 +140,62 @@ def slurm_state_ok(node_states):
     return True
 
 
-def check_node_ready(node, node_states, max_load_ratio, dry_run):
-    """Pre-deployment check: Slurm state, ssh reachability, current load.
+def parse_os_release(text):
+    """Return (os_id, major_version) parsed from /etc/os-release content."""
+    os_id, version = None, None
+    for line in text.splitlines():
+        line = line.strip()
+        if line.startswith("ID="):
+            os_id = line[3:].strip().strip('"\'').lower()
+        elif line.startswith("VERSION_ID="):
+            version = line[11:].strip().strip('"\'')
+    major = None
+    if version:
+        m = re.match(r"(\d+)", version)
+        if m:
+            major = int(m.group(1))
+    return os_id, major
 
-    Returns (ready, reason).
+
+def os_supported(os_id, major):
+    return os_id in ALLOWED_OS_IDS and major is not None and major >= MIN_OS_MAJOR
+
+
+def check_node_ready(node, node_states, max_load_ratio, dry_run):
+    """Pre-deployment check: Slurm state, ssh reachability, OS, load.
+
+    Returns (status, reason) where status is one of:
+      'ready'       - ok to add targets and deploy now
+      'retry'       - temporarily unavailable, re-check next run
+      'unsupported' - OS below RHEL/Rocky 8, exclude from targets/deploy
     """
     if not slurm_state_ok(node_states):
-        return False, "slurm state %s" % ",".join(sorted(node_states))
+        return "retry", "slurm state %s" % ",".join(sorted(node_states))
     if dry_run:
-        return True, "slurm state ok (ssh/load check skipped in dry-run)"
-    cmd = ["clush", *CLUSH_OPTS, "-N", "-w", node, "cat /proc/loadavg && nproc"]
+        return "ready", "slurm state ok (ssh/os/load check skipped in dry-run)"
+    cmd = ["clush", *CLUSH_OPTS, "-N", "-w", node,
+           "cat /etc/os-release && echo ___ && cat /proc/loadavg && nproc"]
     try:
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
     except subprocess.TimeoutExpired:
-        return False, "ssh check timed out"
+        return "retry", "ssh check timed out"
     if result.returncode != 0:
-        return False, "unreachable via ssh"
-    lines = [l.strip() for l in result.stdout.splitlines() if l.strip()]
+        return "retry", "unreachable via ssh"
+    os_part, sep, load_part = result.stdout.partition("___")
+    lines = [l.strip() for l in load_part.splitlines() if l.strip()]
     try:
         load1 = float(lines[0].split()[0])
         ncpu = int(lines[1])
     except (IndexError, ValueError):
-        return False, "could not parse load output: %r" % result.stdout
+        return "retry", "could not parse probe output: %r" % result.stdout
+    os_id, major = parse_os_release(os_part)
+    if not os_supported(os_id, major):
+        return "unsupported", "unsupported OS %s %s (need %s >= %d)" % (
+            os_id or "?", major if major is not None else "?",
+            "/".join(sorted(ALLOWED_OS_IDS)), MIN_OS_MAJOR)
     if load1 > ncpu * max_load_ratio:
-        return False, "load too high (load1=%.1f, %d CPUs)" % (load1, ncpu)
-    return True, "ok (load1=%.1f, %d CPUs)" % (load1, ncpu)
+        return "retry", "load too high (load1=%.1f, %d CPUs)" % (load1, ncpu)
+    return "ready", "ok (%s %d, load1=%.1f, %d CPUs)" % (os_id, major, load1, ncpu)
 
 
 def parse_targets_file(path):
@@ -298,15 +339,17 @@ def main():
     def eligible_nodes(gpu_only):
         return gpu_nodes if gpu_only else slurm_nodes
 
-    # Step 1: bring the Prometheus target files up to date.
-    for name, (filename, port, _salt, gpu_only) in EXPORTERS.items():
+    # Parse the target files up front; also bootstrap deployment state
+    # from them on the very first run.
+    target_files = {}
+    for name, (filename, _port, _salt, _gpu_only) in EXPORTERS.items():
         path = os.path.join(args.targets_dir, filename)
         try:
             lines, existing = parse_targets_file(path)
         except OSError as e:
             log.error("cannot read %s: %s", path, e)
-            exit_code = 1
-            continue
+            return 1
+        target_files[name] = (path, lines, existing)
         if not state_existed:
             # First run: nodes already present in the targets file are
             # assumed deployed, so we don't re-apply salt to the whole
@@ -314,7 +357,40 @@ def main():
             state[name] = sorted(existing)
             log.info("%s exporter: bootstrapped state with %d already-known node(s)",
                      name, len(existing))
-        missing = [n for n in eligible_nodes(gpu_only) if n not in existing]
+
+    # Step 1: readiness check for all nodes pending deployment
+    # (available in Slurm, reachable via ssh, supported OS, load not
+    # too high). Temporarily unavailable nodes are re-checked next run;
+    # nodes on an unsupported OS (< RHEL/Rocky 8) are excluded from
+    # both targets and deployment.
+    pending_union = set()
+    for name, (_f, _p, _s, gpu_only) in EXPORTERS.items():
+        deployed = set(state[name])
+        pending_union |= {n for n in eligible_nodes(gpu_only)
+                          if n not in deployed}
+
+    ready = set()
+    for node in sorted(pending_union):
+        status, reason = check_node_ready(
+            node, node_states.get(node, set()),
+            args.max_load_ratio, args.dry_run)
+        if status == "ready":
+            log.info("%s: ready for deployment - %s", node, reason)
+            ready.add(node)
+        elif status == "unsupported":
+            log.warning("%s: excluded - %s", node, reason)
+        else:
+            log.warning("%s: skipping this run (%s); will retry next run",
+                        node, reason)
+
+    # Step 2: bring the Prometheus target files up to date. Only nodes
+    # that are ready now (or were already deployed earlier) are added,
+    # so unsupported-OS nodes never become dead scrape targets.
+    for name, (filename, port, _salt, gpu_only) in EXPORTERS.items():
+        path, lines, existing = target_files[name]
+        deployed = set(state[name])
+        missing = [n for n in eligible_nodes(gpu_only)
+                   if n not in existing and (n in ready or n in deployed)]
         if not missing:
             log.info("%s: up to date (%d targets)", filename, len(existing))
             continue
@@ -324,29 +400,8 @@ def main():
             log.error("cannot update %s: %s", path, e)
             exit_code = 1
 
-    # Step 2: deploy exporters to nodes not yet successfully deployed,
-    # but only to nodes that pass the readiness check (available in
-    # Slurm, reachable via ssh, not under high load). Nodes that fail
-    # the check stay pending and are re-checked on the next run.
+    # Step 3: deploy exporters to ready nodes not yet deployed.
     if not args.no_deploy:
-        pending_union = set()
-        for name, (_f, _p, _s, gpu_only) in EXPORTERS.items():
-            deployed = set(state[name])
-            pending_union |= {n for n in eligible_nodes(gpu_only)
-                              if n not in deployed}
-
-        ready = set()
-        for node in sorted(pending_union):
-            ok, reason = check_node_ready(
-                node, node_states.get(node, set()),
-                args.max_load_ratio, args.dry_run)
-            if ok:
-                log.info("%s: ready for deployment - %s", node, reason)
-                ready.add(node)
-            else:
-                log.warning("%s: skipping this run (%s); will retry next run",
-                            node, reason)
-
         for name, (_filename, _port, salt_state, gpu_only) in EXPORTERS.items():
             deployed = set(state[name])
             pending = [n for n in eligible_nodes(gpu_only)
