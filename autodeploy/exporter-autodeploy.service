@@ -6,8 +6,9 @@ Wants=network-online.target
 [Service]
 Type=oneshot
 ExecStart=/usr/local/bin/autodeploy_exporters.py
-# Needs root (or a user) able to: run sinfo, write /db/prometheus/targets,
-# ssh via clush to compute nodes and run salt-call.
+# Runs on the admin node (e.g. admin001). Needs root (or a user) able to:
+# run sinfo, ssh via clush to compute nodes and run salt-call, and ssh as
+# root@vcore001 (passwordless key) to update /db/prometheus/targets there.
 User=root
 StateDirectory=exporter-autodeploy
 TimeoutStartSec=30min

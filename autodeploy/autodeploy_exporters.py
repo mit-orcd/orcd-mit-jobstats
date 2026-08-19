@@ -2,11 +2,18 @@
 """
 Automatic deployment of jobstats exporters to new Slurm nodes (ORCD MIT).
 
-Intended to run on the Prometheus server (e.g. via systemd timer, a few
-times daily). On each run it:
+Intended to run on an admin node (e.g. admin001) that has ssh/salt
+access to the compute nodes (e.g. via systemd timer, a few times
+daily). The Prometheus file_sd target files live on the Prometheus
+server (e.g. vcore001) and are updated remotely over ssh, since the
+Prometheus server itself does not have the security settings to push
+deployments to compute nodes. On each run the script:
 
-  1. Discovers all nodes currently known to Slurm (`sinfo`), including
-     whether each node has GPUs (gpu GRES).
+  0. Verifies that the Prometheus server is reachable via ssh and that
+     the targets directory there exists and is writable - otherwise it
+     aborts before touching anything.
+  1. Discovers all nodes currently known to Slurm (`sinfo`, run
+     locally), including whether each node has GPUs (gpu GRES).
   2. Checks that each new (not yet deployed) node is ready for
      deployment:
        - Slurm state is healthy (not down/drained/maintenance/not
@@ -17,21 +24,24 @@ times daily). On each run it:
          Nodes on older/other OSes are excluded entirely (no targets,
          no deployment) until they are reinstalled/upgraded.
   3. Appends ready nodes missing from the Prometheus file_sd target
-     files (cgroup_targets.yml, gpu_targets.yml, node_targets.yml)
+     files (cgroup_targets.yml, gpu_targets.yml, node_targets.yml) in
+     TARGETS_DIR on the Prometheus server (--prom-host, over ssh)
      using the '<node><suffix>:<port>' convention. GPU nodes go into
      all three files; CPU-only nodes are added to cgroup and node
-     targets only. Files are rewritten atomically and existing
-     content/format is preserved.
+     targets only. Files are rewritten atomically on the remote side
+     and existing content/format/ownership is preserved.
   4. Deploys the exporters (all three on GPU nodes, cgroup + node on
-     CPU-only nodes) to ready nodes that have not yet been successfully
-     deployed, via:
+     CPU-only nodes) from this host to ready nodes that have not yet
+     been successfully deployed, via:
          clush -o "-oConnectTimeout=3" -w <nodes> \
              'salt-call state.apply engaging.role.<exporter>'
-     Deployment success is tracked per exporter in a state file, so a
-     failed salt run is retried automatically on the next timer run
-     (salt states are idempotent).
+     Deployment success is tracked per exporter in a local state file,
+     so a failed salt run is retried automatically on the next timer
+     run (salt states are idempotent).
 
 Run with --dry-run to see what would change without touching anything.
+Run with --prom-host '' if the targets directory is local (old
+single-server layout, everything on the Prometheus server).
 """
 
 import argparse
@@ -48,7 +58,17 @@ import tempfile
 # Configuration
 # --------------------------------------------------------------------------
 
+# ssh destination (user@host) of the Prometheus server that holds the
+# file_sd target files. Empty string means the targets dir is local to
+# the host running this script.
+PROM_HOST = "root@vcore001"
+
+# Prometheus file_sd targets directory (on PROM_HOST).
 TARGETS_DIR = "/db/prometheus/targets"
+
+# ssh options used when talking to PROM_HOST. BatchMode makes a missing
+# or broken ssh key fail immediately instead of prompting for a password.
+PROM_SSH_OPTS = ["-oConnectTimeout=5", "-oBatchMode=yes"]
 
 # Suffix appended to the Slurm node name to build the scrape address.
 NODE_SUFFIX = ".inband"
@@ -61,7 +81,8 @@ EXPORTERS = {
     "node":   ("node_targets.yml",   9100, "engaging.role.node-exporter", False),
 }
 
-# Tracks which nodes each exporter has been successfully deployed to.
+# Tracks which nodes each exporter has been successfully deployed to
+# (local file on the host running this script).
 STATE_FILE = "/var/lib/exporter-autodeploy/state.json"
 
 CLUSH_OPTS = ["-o", "-oConnectTimeout=3"]
@@ -90,6 +111,41 @@ log = logging.getLogger("exporter-autodeploy")
 
 TARGET_LINE_RE = re.compile(r"^(\s*-\s*)['\"]?([^'\":]+):(\d+)['\"]?\s*$")
 DEFAULT_INDENT = "     - "
+
+# Exit code used on the remote side to signal "file does not exist"
+# (distinguishable from cat/permission failures and from ssh's own 255).
+ABSENT_RC = 42
+
+
+def prom_ssh(host, command, input_text=None, timeout=60):
+    """Run a shell command on the Prometheus server via ssh."""
+    cmd = ["ssh", *PROM_SSH_OPTS, host, command]
+    return subprocess.run(cmd, input=input_text, capture_output=True,
+                          text=True, timeout=timeout)
+
+
+def check_prom_host(host, targets_dir):
+    """Verify the Prometheus server can be updated: ssh works and the
+    targets directory exists and is writable. Returns an error string,
+    or None if everything is fine.
+    """
+    qdir = shlex.quote(targets_dir)
+    try:
+        result = prom_ssh(host, "true", timeout=30)
+    except subprocess.TimeoutExpired:
+        return "ssh to %s timed out" % host
+    if result.returncode != 0:
+        return "cannot ssh to %s: %s" % (
+            host, result.stderr.strip() or "exit code %d" % result.returncode)
+    try:
+        result = prom_ssh(
+            host, "test -d %s && test -w %s" % (qdir, qdir), timeout=30)
+    except subprocess.TimeoutExpired:
+        return "checking %s on %s timed out" % (targets_dir, host)
+    if result.returncode != 0:
+        return "targets directory %s on %s is missing or not writable" % (
+            targets_dir, host)
+    return None
 
 
 def get_slurm_nodes(exclude_re=None):
@@ -198,15 +254,33 @@ def check_node_ready(node, node_states, max_load_ratio, dry_run):
     return "ready", "ok (%s %d, load1=%.1f, %d CPUs)" % (os_id, major, load1, ncpu)
 
 
-def parse_targets_file(path):
-    """Return (lines, hostnames) for a targets yml file.
-
-    hostnames are the bare node names (suffix stripped) already present.
+def read_targets_file(host, path):
+    """Return the lines of a targets yml file (local, or on the
+    Prometheus server when host is set), or None if the file does not
+    exist. Raises OSError on any other failure.
     """
-    if not os.path.exists(path):
-        return ["- targets:\n"], set()
-    with open(path) as f:
-        lines = f.readlines()
+    if not host:
+        if not os.path.exists(path):
+            return None
+        with open(path) as f:
+            return f.readlines()
+    qpath = shlex.quote(path)
+    try:
+        result = prom_ssh(
+            host, "if [ -e %s ]; then cat %s; else exit %d; fi"
+            % (qpath, qpath, ABSENT_RC))
+    except subprocess.TimeoutExpired:
+        raise OSError("reading %s on %s timed out" % (path, host))
+    if result.returncode == ABSENT_RC:
+        return None
+    if result.returncode != 0:
+        raise OSError("cannot read %s on %s: %s" % (
+            path, host, result.stderr.strip() or "exit %d" % result.returncode))
+    return result.stdout.splitlines(keepends=True)
+
+
+def parse_target_hosts(lines):
+    """Return the bare node names (suffix stripped) present in the lines."""
     hosts = set()
     for line in lines:
         m = TARGET_LINE_RE.match(line)
@@ -215,10 +289,61 @@ def parse_targets_file(path):
             if NODE_SUFFIX and host.endswith(NODE_SUFFIX):
                 host = host[: -len(NODE_SUFFIX)]
             hosts.add(host)
-    return lines, hosts
+    return hosts
 
 
-def append_targets(path, lines, new_nodes, port, dry_run):
+def write_targets_file_local(path, content):
+    """Atomic local write, preserving mode/ownership of an existing file."""
+    dirname = os.path.dirname(path) or "."
+    fd, tmp = tempfile.mkstemp(dir=dirname, prefix=os.path.basename(path) + ".")
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write(content)
+        if os.path.exists(path):
+            st = os.stat(path)
+            os.chmod(tmp, st.st_mode)
+            try:
+                os.chown(tmp, st.st_uid, st.st_gid)
+            except PermissionError:
+                pass
+        os.replace(tmp, path)
+    except BaseException:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+        raise
+
+
+def write_targets_file_remote(host, path, content):
+    """Atomic write on the Prometheus server: upload to a temp file in
+    the same directory, copy mode/ownership from the existing file, then
+    mv into place so Prometheus file_sd never sees a partial file.
+    """
+    qpath = shlex.quote(path)
+    qtemplate = shlex.quote(os.path.join(
+        os.path.dirname(path) or ".",
+        "." + os.path.basename(path) + ".XXXXXX"))
+    remote_cmd = (
+        'set -e; '
+        'tmp=$(mktemp %(template)s); '
+        'trap \'rm -f "$tmp"\' EXIT; '
+        'cat > "$tmp"; '
+        'if [ -e %(path)s ]; then '
+        'chmod --reference=%(path)s "$tmp"; '
+        'chown --reference=%(path)s "$tmp" 2>/dev/null || true; '
+        'fi; '
+        'mv -f "$tmp" %(path)s; '
+        'trap - EXIT'
+        % {"template": qtemplate, "path": qpath})
+    try:
+        result = prom_ssh(host, remote_cmd, input_text=content)
+    except subprocess.TimeoutExpired:
+        raise OSError("writing %s on %s timed out" % (path, host))
+    if result.returncode != 0:
+        raise OSError("cannot write %s on %s: %s" % (
+            path, host, result.stderr.strip() or "exit %d" % result.returncode))
+
+
+def append_targets(host, path, lines, new_nodes, port, dry_run):
     """Append new target entries after the last existing target line."""
     # Match indentation of existing entries if possible.
     indent = DEFAULT_INDENT
@@ -235,31 +360,19 @@ def append_targets(path, lines, new_nodes, port, dry_run):
     else:
         updated = lines + new_lines
 
+    where = "%s:%s" % (host, path) if host else path
     if dry_run:
         for nl in new_lines:
-            log.info("[dry-run] %s: would append %s", path, nl.strip())
+            log.info("[dry-run] %s: would append %s", where, nl.strip())
         return
 
-    # Atomic write so Prometheus file_sd never sees a partial file.
-    dirname = os.path.dirname(path) or "."
-    fd, tmp = tempfile.mkstemp(dir=dirname, prefix=os.path.basename(path) + ".")
-    try:
-        with os.fdopen(fd, "w") as f:
-            f.writelines(updated)
-        if os.path.exists(path):
-            st = os.stat(path)
-            os.chmod(tmp, st.st_mode)
-            try:
-                os.chown(tmp, st.st_uid, st.st_gid)
-            except PermissionError:
-                pass
-        os.replace(tmp, path)
-    except BaseException:
-        if os.path.exists(tmp):
-            os.unlink(tmp)
-        raise
+    content = "".join(updated)
+    if host:
+        write_targets_file_remote(host, path, content)
+    else:
+        write_targets_file_local(path, content)
     for nl in new_lines:
-        log.info("%s: appended %s", path, nl.strip())
+        log.info("%s: appended %s", where, nl.strip())
 
 
 def load_state(path):
@@ -305,8 +418,13 @@ def deploy_exporter(salt_state, nodes, dry_run):
 def main():
     parser = argparse.ArgumentParser(
         description="Auto-deploy jobstats exporters to new Slurm nodes.")
+    parser.add_argument("--prom-host", default=PROM_HOST,
+                        help="ssh destination (user@host) of the Prometheus "
+                             "server holding the targets dir; '' = targets "
+                             f"dir is local (default: {PROM_HOST})")
     parser.add_argument("--targets-dir", default=TARGETS_DIR,
-                        help=f"Prometheus targets directory (default: {TARGETS_DIR})")
+                        help="Prometheus targets directory on --prom-host "
+                             f"(default: {TARGETS_DIR})")
     parser.add_argument("--state-file", default=STATE_FILE,
                         help=f"deployment state file (default: {STATE_FILE})")
     parser.add_argument("--exclude", metavar="REGEX", default=None,
@@ -321,6 +439,27 @@ def main():
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO, format=LOG_FORMAT, stream=sys.stdout)
+
+    prom_host = args.prom_host.strip()
+
+    # Preflight: make sure the Prometheus server can actually be updated
+    # before discovering/deploying anything. Read-only, so it also runs
+    # in dry-run mode (as a warning only there).
+    if prom_host:
+        error = check_prom_host(prom_host, args.targets_dir)
+        if error:
+            if args.dry_run:
+                log.warning("[dry-run] Prometheus server check failed: %s "
+                            "(a real run would abort here)", error)
+            else:
+                log.error("Prometheus server check failed: %s", error)
+                return 1
+        else:
+            log.info("Prometheus server %s reachable, %s writable",
+                     prom_host, args.targets_dir)
+    else:
+        log.info("--prom-host empty: using local targets dir %s",
+                 args.targets_dir)
 
     try:
         slurm_nodes, gpu_nodes, node_states = get_slurm_nodes(args.exclude)
@@ -345,10 +484,13 @@ def main():
     for name, (filename, _port, _salt, _gpu_only) in EXPORTERS.items():
         path = os.path.join(args.targets_dir, filename)
         try:
-            lines, existing = parse_targets_file(path)
+            lines = read_targets_file(prom_host, path)
         except OSError as e:
             log.error("cannot read %s: %s", path, e)
             return 1
+        if lines is None:
+            lines = ["- targets:\n"]
+        existing = parse_target_hosts(lines)
         target_files[name] = (path, lines, existing)
         if not state_existed:
             # First run: nodes already present in the targets file are
@@ -395,7 +537,7 @@ def main():
             log.info("%s: up to date (%d targets)", filename, len(existing))
             continue
         try:
-            append_targets(path, lines, missing, port, args.dry_run)
+            append_targets(prom_host, path, lines, missing, port, args.dry_run)
         except OSError as e:
             log.error("cannot update %s: %s", path, e)
             exit_code = 1
