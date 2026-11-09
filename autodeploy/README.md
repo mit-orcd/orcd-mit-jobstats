@@ -97,9 +97,12 @@ locally:
 3. **Remove**: drops entries for nodes that are no longer defined in Slurm,
    or that are still in Slurm but lack the required feature (e.g. existing
    `centos7` entries). Safety rails:
-   - Only **managed** entries are removed — nodes this script has seen in
-     Slurm at least once. Hand-added, non-Slurm targets (e.g. infrastructure
-     servers in `node_targets.yml`) are never touched.
+   - Only **managed** entries are removed: nodes this script has seen in
+     Slurm at least once, or whose name matches `--node-pattern` (default
+     `^node\d`, which catches nodes decommissioned before the sync was first
+     installed). Other targets (e.g. infrastructure servers such as
+     `infra01` in `node_targets.yml`) are never touched; each run logs them
+     as "leaving N entries untouched".
    - A node must be ineligible in `--remove-after` consecutive runs
      (default 2) before removal, so one bad Slurm query cannot drop it.
    - If more than `--max-remove` nodes (default 20) would be removed in one

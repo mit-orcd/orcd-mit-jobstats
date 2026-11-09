@@ -24,9 +24,11 @@ On each run:
   3. REMOVE: drops entries for nodes that are no longer defined in Slurm
      or no longer have a required feature (e.g. centos7 nodes).
      Safety rails:
-       - only "managed" entries are ever removed, i.e. nodes this script
-         has seen in Slurm at least once. Hand-added non-Slurm targets
-         (e.g. infrastructure servers in node_targets.yml) are left alone;
+       - only "managed" entries are ever removed: nodes this script has
+         seen in Slurm at least once, or whose name matches --node-pattern
+         (default ^node<digit>, catches nodes decommissioned before the
+         first run). Other targets (e.g. infrastructure servers in
+         node_targets.yml) are left alone;
        - a node must be ineligible in --remove-after consecutive runs
          (default 2) before it is removed;
        - if more than --max-remove nodes would be removed in a single run,
@@ -53,6 +55,11 @@ TARGETS_DIR = "/db/prometheus/targets"
 STATE_FILE = "/var/lib/prometheus-targets-sync/state.json"
 REMOVE_AFTER = 2
 MAX_REMOVE = 20
+
+# Target names matching this are compute nodes owned by this script even if
+# it never saw them in Slurm (e.g. decommissioned before the first run), so
+# they are removed when not in Slurm. Other names (infra servers) are kept.
+NODE_NAME_PATTERN = r"^node\d"
 
 TARGET_LINE_RE = re.compile(r"^(\s*-\s*)['\"]?([^'\":\s]+):(\d+)['\"]?\s*$")
 DEFAULT_INDENT = "     - "
@@ -122,6 +129,11 @@ def main():
                         help="only keep nodes with this Slurm feature in the "
                              "targets; repeat to allow any of several "
                              "(default: %s)" % ",".join(ec.REQUIRED_FEATURES))
+    parser.add_argument("--node-pattern", metavar="REGEX", default=NODE_NAME_PATTERN,
+                        help="target names matching this are treated as Slurm "
+                             "compute nodes and removed when not in Slurm, even "
+                             "if never seen there; '' to only remove nodes seen "
+                             "in Slurm (default: %s)" % NODE_NAME_PATTERN)
     parser.add_argument("--no-probe", action="store_true",
                         help="add every Slurm node without checking that its "
                              "exporter answers")
@@ -163,6 +175,10 @@ def main():
     feature_label = "/".join(sorted(required))
     slurm_nodes, no_feature = ec.split_by_features(slurm_nodes, node_features, required)
     gpu_nodes, _ = ec.split_by_features(gpu_nodes, node_features, required)
+    if not slurm_nodes:
+        log.error("no Slurm node has feature %s (check `sinfo -o \"%%N %%f\"` "
+                  "or --feature); refusing to continue", feature_label)
+        return 1
     if no_feature:
         log.info("%d node(s) without feature %s are not kept as targets: %s",
                  len(no_feature), feature_label, ",".join(no_feature))
@@ -176,6 +192,8 @@ def main():
     managed = set(state.get("managed", []))
     missing_runs = dict(state.get("missing_runs", {}))
 
+    node_name_re = re.compile(args.node_pattern) if args.node_pattern else None
+
     files = {}
     for name, (filename, port, _salt, gpu_only) in ec.EXPORTERS.items():
         path = os.path.join(args.targets_dir, filename)
@@ -187,6 +205,15 @@ def main():
         entries = target_entries(lines)
         files[name] = (path, port, gpu_only, lines, entries)
         managed |= set(entries) & slurm_set
+        if node_name_re:
+            managed |= {e for e in entries if node_name_re.search(e)}
+        unknown = sorted(set(entries) - slurm_set - managed)
+        if unknown:
+            log.info("%s: leaving %d entr%s untouched (not a Slurm node, not "
+                     "matching --node-pattern %r): %s", filename,
+                     len(unknown), "y" if len(unknown) == 1 else "ies",
+                     args.node_pattern, ",".join(unknown[:20]) +
+                     (",..." if len(unknown) > 20 else ""))
 
     present_anywhere = set()
     for (_p, _port, _g, _l, entries) in files.values():
