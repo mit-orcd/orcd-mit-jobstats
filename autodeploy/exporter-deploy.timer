@@ -1,5 +1,5 @@
 [Unit]
-Description=Run exporter auto-deployment a few times daily
+Description=Deploy jobstats exporters to new Slurm nodes a few times daily
 
 [Timer]
 # 4x daily: 02:00, 08:00, 14:00, 20:00

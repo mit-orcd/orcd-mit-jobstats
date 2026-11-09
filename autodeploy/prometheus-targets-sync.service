@@ -1,0 +1,14 @@
+[Unit]
+Description=Sync Prometheus jobstats target files with Slurm nodes
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/opt/exporter-autodeploy/sync_prometheus_targets.py
+# Runs on the Prometheus server (core025). Needs write access to
+# /db/prometheus/targets and either a working scontrol, or
+# --slurm-ssh USER@HOST with a passwordless key to a host that has one.
+User=root
+StateDirectory=prometheus-targets-sync
+TimeoutStartSec=10min

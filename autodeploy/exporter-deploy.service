@@ -1,0 +1,13 @@
+[Unit]
+Description=Deploy jobstats exporters to new Slurm nodes
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/opt/exporter-autodeploy/deploy_exporters.py
+# Runs on the admin node (admin001). Needs a user able to run scontrol,
+# and clush/ssh to compute nodes with salt-call there.
+User=root
+StateDirectory=exporter-deploy
+TimeoutStartSec=30min

@@ -1,169 +1,224 @@
-# Exporter auto-deployment for new Slurm nodes
+# Exporter auto-deployment and Prometheus target sync
 
-Automation that keeps the Prometheus targets in sync with the Slurm cluster
-and deploys the jobstats exporters (cgroup, node, nvidia-gpu) to newly added
-nodes via salt.
+Automation that deploys the jobstats exporters (cgroup, node, nvidia-gpu)
+to new Slurm nodes and keeps the Prometheus file_sd target files in sync
+with the Slurm cluster. It is split into two independent services, one
+per host, because the Prometheus server (`core025`) cannot run clush/salt
+against the compute nodes:
 
-Runs on an **admin node** (e.g. `admin001`) on a systemd timer (4x daily by
-default). The admin node is the host with the security settings required to
-push deployments to compute nodes (clush/ssh + salt); the Prometheus server
-(e.g. `vcore001`) does not have that access, so it only holds the file_sd
-target files, which this automation updates remotely over ssh
-(`root@vcore001` by default, see `PROM_HOST` / `--prom-host`).
+| Host | Service | Does |
+|------|---------|------|
+| **admin001** | `exporter-deploy.timer` → `deploy_exporters.py` | Deploys exporters to new nodes via clush + salt |
+| **core025** (Prometheus) | `prometheus-targets-sync.timer` → `sync_prometheus_targets.py` | Adds new nodes to / removes departed nodes from the target files |
 
-## Architecture
+The two services do not talk to each other. They are coupled only through
+the exporters themselves: admin001 deploys an exporter, and core025 adds a
+node to a targets file once that node's exporter answers on its port.
 
 ```
-admin001 (this automation)                 vcore001 (Prometheus)
-  - sinfo: discover new Slurm nodes          - /db/prometheus/targets/
-  - clush/ssh + salt-call: deploy       ssh      cgroup_targets.yml
-    exporters to compute nodes         ----->    gpu_targets.yml
-  - state: /var/lib/exporter-autodeploy/         node_targets.yml
+admin001                                       core025 (Prometheus)
+  scontrol: list Slurm nodes                     scontrol: list Slurm nodes
+  probe exporter ports                           probe exporter ports
+  clush + salt-call: deploy  ──► compute ◄──     add/remove entries in
+  state: /var/lib/exporter-deploy/  nodes        /db/prometheus/targets/*.yml
+                                                 state: /var/lib/prometheus-targets-sync/
 ```
 
-## What it does on each run
+Files:
 
-0. **Preflight**: verifies the Prometheus server (`--prom-host`) is
-   reachable via ssh and that `/db/prometheus/targets` there exists and is
-   writable. If not, the run aborts before touching anything (in
-   `--dry-run` this is reported as a warning only).
-1. Queries Slurm (locally) for the current node list and GPU info
-   (`sinfo -h -N -o '%N|%G|%t'`). A node counts as a GPU node if its GRES
-   contains a `gpu:` entry.
-2. Runs a readiness check on every node pending deployment:
-   - **Slurm state** must be healthy — nodes that are down, drained,
-     draining, failed, in maintenance, powered off, rebooting, or not
-     responding (`*`/`~`/`#`/... state flags) are skipped;
-   - **ssh reachability** — the node must answer via clush/ssh;
-   - **OS** — `/etc/os-release` must report RHEL or Rocky with major
-     version >= 8. Nodes on anything older (e.g. CentOS/RHEL 7) are
-     excluded entirely: no targets, no deployment. They are re-checked
-     each run, so a node is picked up automatically after an OS
-     reinstall/upgrade;
-   - **load** — the 1-min load average must not exceed
-     `CPUs * --max-load-ratio` (default 1.0), so heavily utilized nodes
-     are not disturbed.
+- `exporter_common.py` — shared code (exporter list, Slurm query, port probe); install on both hosts
+- `deploy_exporters.py`, `exporter-deploy.service`, `exporter-deploy.timer` — admin001
+- `sync_prometheus_targets.py`, `prometheus-targets-sync.service`, `prometheus-targets-sync.timer` — core025
 
-   Nodes failing a transient check (state/ssh/load) are skipped with a
-   warning and automatically re-checked on the next timer run.
-3. For each targets file in `/db/prometheus/targets/` **on the Prometheus
-   server** (read and written over ssh):
-   - `cgroup_targets.yml` (port 9306) — all nodes
-   - `gpu_targets.yml` (port 9445) — GPU nodes only
-   - `node_targets.yml` (port 9100) — all nodes
+Exporters, ports, and salt states (defined in `exporter_common.py`):
 
-   appends ready nodes not already present as `'<node>.inband:<port>'`,
-   preserving the existing file format, mode, and ownership.
-   Unsupported-OS nodes are never added, so they don't become
-   permanently-down scrape targets. Remote writes are atomic (temp file +
-   `mv` in the same directory), so Prometheus file_sd never sees a partial
-   file (no Prometheus reload needed with file_sd).
-4. Deploys the exporters **from the admin node** to ready nodes that
-   haven't been deployed to yet (cgroup + node exporters on every new
-   node, nvidia-gpu exporter only on new GPU nodes):
+| Exporter | Targets file | Port | Salt state | Nodes |
+|----------|--------------|------|------------|-------|
+| cgroup | `cgroup_targets.yml` | 9306 | `engaging.role.cgroup-exporter` | all |
+| gpu | `gpu_targets.yml` | 9445 | `engaging.role.nvidia-gpu-exporter` | GPU nodes (gpu GRES) |
+| node | `node_targets.yml` | 9100 | `engaging.role.node-exporter` | all |
+
+Nodes are listed with `scontrol -o show node`, which includes every node
+defined in Slurm, even nodes in no partition. A node counts as a GPU node
+if its `Gres` contains a `gpu` entry. Scrape addresses are
+`<node>.inband:<port>`.
+
+## admin001: `deploy_exporters.py`
+
+Each run (4x daily by default):
+
+1. Lists all Slurm nodes.
+2. Drops nodes that are no longer in Slurm from the deployment state, so
+   a node re-added later under the same name gets deployed again.
+3. For each exporter, takes nodes not yet marked deployed and probes the
+   exporter port (`http://<node>.inband:<port>/metrics`). Nodes where it
+   already answers are marked deployed without running salt. This also
+   bootstraps the state on the first run.
+4. Runs a readiness check on the remaining nodes:
+   - **Slurm state** healthy — down, drained, failing, maintenance,
+     powered off, rebooting, or not-responding nodes are retried next run;
+   - **ssh** reachable via clush;
+   - **OS** RHEL/Rocky >= 8 (`ALLOWED_OS_IDS` / `MIN_OS_MAJOR`). Other
+     nodes are never deployed, so their exporters never answer and core025
+     never adds them as targets;
+   - **load** — 1-min load <= `CPUs * --max-load-ratio` (default 1.0).
+5. Deploys to ready nodes:
 
    ```
-   clush -o "-oConnectTimeout=3" -w <new_nodes> 'salt-call state.apply engaging.role.cgroup-exporter'
-   clush -o "-oConnectTimeout=3" -w <new_nodes> 'salt-call state.apply engaging.role.node-exporter'
-   clush -o "-oConnectTimeout=3" -w <new_nodes> 'salt-call state.apply engaging.role.nvidia-gpu-exporter'
+   clush -o "-oConnectTimeout=3" -w <nodes> 'salt-call state.apply engaging.role.cgroup-exporter'
+   clush -o "-oConnectTimeout=3" -w <nodes> 'salt-call state.apply engaging.role.node-exporter'
+   clush -o "-oConnectTimeout=3" -w <gpu_nodes> 'salt-call state.apply engaging.role.nvidia-gpu-exporter'
    ```
 
-Deployment success is tracked per exporter in
-`/var/lib/exporter-autodeploy/state.json` (local to the admin node). If a
-clush/salt run fails (e.g. a node is down), the affected nodes stay pending
-and deployment is retried on the next timer run — salt states are
-idempotent, so re-applying is safe.
+   Success is recorded per exporter in `/var/lib/exporter-deploy/state.json`.
+   Failed nodes stay pending and are retried next run (salt states are
+   idempotent).
 
-On the very first run (no state file yet), nodes already listed in the
-targets files are assumed to be deployed already, so salt is not re-applied
-to the whole cluster.
+Requirements on admin001: python3 (stdlib only), `scontrol`, `clush` with
+passwordless ssh to compute nodes, `salt-call` on compute nodes, and HTTP
+access to the exporter ports. If HTTP to the nodes is blocked, use
+`--no-probe`; the state file is then the only record of deployed nodes.
 
-## Installation (on the admin node, e.g. admin001)
+## core025: `sync_prometheus_targets.py`
 
-Requirements on the admin node:
+Each run (hourly by default) edits the files in `/db/prometheus/targets`
+locally:
 
-- python3 (stdlib only)
-- `sinfo` (slurm client) working locally
-- `clush` with passwordless ssh/root access to the compute nodes, and
-  `salt-call` usable on the compute nodes
-- passwordless ssh as `root@vcore001` (see below), with write access to
-  `/db/prometheus/targets` there
+1. Lists all Slurm nodes.
+2. **Add**: for each Slurm node missing from a targets file (GPU nodes only
+   for `gpu_targets.yml`), probes the exporter port and appends
+   `'<node>.inband:<port>'` only if the exporter answers. New nodes appear
+   within about an hour of admin001 deploying them.
+3. **Remove**: drops entries for nodes that are no longer defined in Slurm.
+   Safety rails:
+   - Only **managed** entries are removed — nodes this script has seen in
+     Slurm at least once. Hand-added, non-Slurm targets (e.g. infrastructure
+     servers in `node_targets.yml`) are never touched.
+   - A node must be missing from Slurm in `--remove-after` consecutive runs
+     (default 2) before removal, so one bad Slurm query cannot drop it.
+   - If more than `--max-remove` nodes (default 20) would be removed in one
+     run, nothing is removed and the run fails. Use `--force` to confirm a
+     large decommission.
+   - An empty or failed Slurm query aborts the run.
 
-Set up the ssh key to the Prometheus server (once, as root on admin001):
+   Nodes that are down or drained but still defined in Slurm are kept.
+
+Edits preserve the rest of each file (labels, other target groups,
+indentation, mode, ownership). Writes are atomic (temp file + rename), so
+Prometheus file_sd sees the change without a reload.
+
+Requirements on core025: python3 (stdlib only), write access to
+`/db/prometheus/targets`, and either a working `scontrol` (Slurm client +
+munge) or `--slurm-ssh USER@HOST` with a passwordless ssh key to a host
+that has one (e.g. a login node).
+
+## Installation
+
+### With `deploy.sh` (recommended)
+
+Run as root on **admin001** from a checkout of this repo. It installs the
+deploy service locally and the target sync on core025 over ssh
+(passwordless `root@core025` key required). Each side runs a `--dry-run`
+check before its timer is enabled:
 
 ```bash
-# Generate a dedicated key if root has none yet:
-ssh-keygen -t ed25519 -f /root/.ssh/id_ed25519 -N ''
-ssh-copy-id root@vcore001          # or add the pubkey to vcore001:/root/.ssh/authorized_keys
-
-# Verify - both must succeed non-interactively:
-ssh -oBatchMode=yes root@vcore001 true
-ssh -oBatchMode=yes root@vcore001 'test -d /db/prometheus/targets -a -w /db/prometheus/targets && echo OK'
+./autodeploy/deploy.sh                                   # admin001 + root@core025
+./autodeploy/deploy.sh --slurm-ssh root@<login-node>     # core025 has no Slurm client
+./autodeploy/deploy.sh --remote-only                     # redeploy only core025
+./autodeploy/deploy.sh --no-enable                       # install, don't start timers
+./autodeploy/deploy.sh --help
 ```
 
-Then install the automation:
+On admin001 it also disables the old `exporter-autodeploy.timer`, removes
+its files, and carries its state over to `/var/lib/exporter-deploy/`
+(skip with `--no-migrate`). On core025 it checks that the targets
+directory is writable and that `scontrol` works (locally, or via
+`--slurm-ssh`, which is saved as a systemd drop-in). Re-running the
+script is safe; use it to roll out updated scripts too.
+
+### Manual
+
+On **both** hosts, copy the scripts to `/opt/exporter-autodeploy`
+(`exporter_common.py` must sit next to the script that imports it):
 
 ```bash
-cp autodeploy_exporters.py /usr/local/bin/
-chmod +x /usr/local/bin/autodeploy_exporters.py
-cp exporter-autodeploy.service exporter-autodeploy.timer /etc/systemd/system/
+mkdir -p /opt/exporter-autodeploy
+cp exporter_common.py deploy_exporters.py sync_prometheus_targets.py /opt/exporter-autodeploy/
+chmod +x /opt/exporter-autodeploy/deploy_exporters.py /opt/exporter-autodeploy/sync_prometheus_targets.py
+```
+
+**admin001:**
+
+```bash
+cp exporter-deploy.service exporter-deploy.timer /etc/systemd/system/
 systemctl daemon-reload
-
-# Confirm the setup end to end (includes the preflight check against
-# vcore001) without changing anything:
-/usr/local/bin/autodeploy_exporters.py --dry-run
-
-systemctl enable --now exporter-autodeploy.timer
+/opt/exporter-autodeploy/deploy_exporters.py --dry-run
+systemctl enable --now exporter-deploy.timer
 ```
 
-If the automation previously ran on the Prometheus server itself, disable
-it there (`systemctl disable --now exporter-autodeploy.timer`) and either
-copy `/var/lib/exporter-autodeploy/state.json` to the admin node or just
-let the first run bootstrap the state from the existing targets files.
+**core025:**
+
+```bash
+cp prometheus-targets-sync.service prometheus-targets-sync.timer /etc/systemd/system/
+systemctl daemon-reload
+/opt/exporter-autodeploy/sync_prometheus_targets.py --dry-run
+systemctl enable --now prometheus-targets-sync.timer
+```
+
+If core025 has no Slurm client, add the ssh option to the unit:
+
+```bash
+systemctl edit prometheus-targets-sync.service
+# [Service]
+# ExecStart=
+# ExecStart=/opt/exporter-autodeploy/sync_prometheus_targets.py --slurm-ssh root@<login-node>
+```
+
+### Migrating from the old combined `autodeploy_exporters.py`
+
+The old single service ran on admin001 and edited the targets files on
+vcore001 over ssh. To switch:
+
+1. On admin001: `systemctl disable --now exporter-autodeploy.timer`, then
+   remove `exporter-autodeploy.{service,timer}` and
+   `/usr/local/bin/autodeploy_exporters.py`.
+2. Optionally keep deployment history:
+   `cp /var/lib/exporter-autodeploy/state.json /var/lib/exporter-deploy/state.json`
+   (same format). Without it, the first run rebuilds the state by probing
+   exporter ports.
+3. Copy the current targets files from vcore001 to
+   `/db/prometheus/targets` on core025 before enabling the sync timer. The
+   first sync run marks every listed Slurm node as managed.
 
 ## Usage
 
 ```bash
-# See what would happen, change nothing:
-autodeploy_exporters.py --dry-run
+# admin001
+deploy_exporters.py --dry-run                # show what would be deployed
+deploy_exporters.py --exclude '^testnode'    # skip nodes by regex
+deploy_exporters.py --max-load-ratio 2.0     # allow busier nodes
+systemctl start exporter-deploy.service; journalctl -u exporter-deploy.service
 
-# Only update target files, skip salt deployment:
-autodeploy_exporters.py --no-deploy
-
-# Different Prometheus server / ssh user:
-autodeploy_exporters.py --prom-host promdeploy@vcore002
-
-# Old single-server layout (targets dir local to this host):
-autodeploy_exporters.py --prom-host ''
-
-# Exclude nodes by regex (e.g. test partition nodes):
-autodeploy_exporters.py --exclude '^testnode'
-
-# Allow deployment to busier nodes (skip only if load1 > 2x CPU count):
-autodeploy_exporters.py --max-load-ratio 2.0
-
-# Run immediately via systemd:
-systemctl start exporter-autodeploy.service
-journalctl -u exporter-autodeploy.service
+# core025
+sync_prometheus_targets.py --dry-run         # show adds/removes, change nothing
+sync_prometheus_targets.py --no-remove       # add only
+sync_prometheus_targets.py --force           # allow > --max-remove removals (decommission)
+sync_prometheus_targets.py --remove-after 1  # remove as soon as a node leaves Slurm
+systemctl start prometheus-targets-sync.service; journalctl -u prometheus-targets-sync.service
 ```
 
-Configuration defaults (Prometheus host, targets dir, node suffix, ports,
-salt states, state file path) live at the top of `autodeploy_exporters.py`
-and can be overridden with `--prom-host` / `--targets-dir` /
-`--state-file`.
+(Scripts live in `/opt/exporter-autodeploy/`.)
 
 ## Notes
 
-- The script never removes targets; decommissioned nodes must be cleaned
-  out of the yml files on vcore001 (and the state file on admin001)
-  manually.
-- ssh to the Prometheus server uses `-oBatchMode=yes`, so a missing or
-  rejected key fails fast with a clear error instead of hanging on a
-  password prompt.
-- The allowed OS list and minimum major version are the `ALLOWED_OS_IDS`
-  and `MIN_OS_MAJOR` constants at the top of the script (default:
-  rhel/rocky, version 8).
-- GPU detection relies on Slurm GRES being configured for the node. If a
-  brand-new GPU node is added before its `Gres=gpu:...` line is set in
-  slurm.conf, it will initially be treated as CPU-only; the gpu exporter
-  is picked up automatically on a later run once GRES is configured.
+- To force a re-deploy on a node (e.g. after changing a salt state), stop
+  its exporter or delete it from `/var/lib/exporter-deploy/state.json`
+  **and** make sure its port no longer answers. Otherwise, apply salt
+  directly with clush — the automation only handles first-time deployment.
+- A node that loses its GPU GRES but stays in Slurm is not removed from
+  `gpu_targets.yml`; only nodes that leave Slurm entirely are removed.
+- `--exclude` on core025 means: never add matching nodes, and never
+  remove their existing entries.
+- GPU detection relies on `Gres=gpu:...` in slurm.conf. A new GPU node
+  added before its GRES is configured is treated as CPU-only until a later
+  run.

@@ -1,0 +1,13 @@
+[Unit]
+Description=Sync Prometheus jobstats target files with Slurm nodes hourly
+
+[Timer]
+# Hourly, so a node is picked up soon after admin001 deploys its exporters
+# (deploy runs 4x daily), and a removed node is dropped after
+# --remove-after (default 2) consecutive runs.
+OnCalendar=hourly
+RandomizedDelaySec=5min
+Persistent=true
+
+[Install]
+WantedBy=timers.target
