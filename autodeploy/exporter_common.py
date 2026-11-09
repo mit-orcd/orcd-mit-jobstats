@@ -30,6 +30,12 @@ EXPORTERS = {
 # Suffix appended to the Slurm node name to build the scrape address.
 NODE_SUFFIX = ".inband"
 
+# Only nodes with at least one of these Slurm node features (`sinfo -o %f`)
+# get exporters deployed and appear in the Prometheus target files; nodes
+# tagged e.g. centos7 are skipped by deployment and removed from targets.
+# Both scripts accept --feature (repeatable) to override.
+REQUIRED_FEATURES = ["rocky8"]
+
 # Slurm node states (scontrol State=, '+'-separated flags) that mean
 # "don't touch this node now".
 UNAVAILABLE_STATE_RE = re.compile(
@@ -58,13 +64,16 @@ def quote_cmd(cmd):
 
 
 def get_slurm_nodes(exclude_re=None, ssh_host=None):
-    """Return (all_nodes, gpu_nodes, states) for every node defined in Slurm.
+    """Return (all_nodes, gpu_nodes, states, features) for every node
+    defined in Slurm.
 
     Uses `scontrol -o show node`, which lists all configured nodes,
     including nodes not in any partition (sinfo would miss those).
     all_nodes/gpu_nodes are sorted lists; states maps node -> set of
-    state flags (e.g. {'IDLE', 'DRAIN'}). If ssh_host is set, scontrol
-    runs there over ssh (for hosts without a Slurm client).
+    state flags (e.g. {'IDLE', 'DRAIN'}); features maps node -> set of
+    available node features (same as `sinfo -o %f`, e.g. {'rocky8'}).
+    If ssh_host is set, scontrol runs there over ssh (for hosts without
+    a Slurm client).
 
     Raises RuntimeError if Slurm cannot be queried.
     """
@@ -80,7 +89,7 @@ def get_slurm_nodes(exclude_re=None, ssh_host=None):
         raise RuntimeError("%s failed: %s" % (
             quote_cmd(cmd), result.stderr.strip() or "exit %d" % result.returncode))
 
-    nodes, gpu_nodes, states = set(), set(), {}
+    nodes, gpu_nodes, states, features = set(), set(), {}, {}
     for line in result.stdout.splitlines():
         fields = dict(_SCONTROL_KV_RE.findall(line.strip()))
         name = fields.get("NodeName")
@@ -88,6 +97,8 @@ def get_slurm_nodes(exclude_re=None, ssh_host=None):
             continue
         nodes.add(name)
         states[name] = {s for s in fields.get("State", "").split("+") if s}
+        features[name] = {f for f in fields.get("AvailableFeatures", "").split(",")
+                          if f and f != "(null)"}
         if _GPU_GRES_RE.search(fields.get("Gres", "")):
             gpu_nodes.add(name)
 
@@ -99,7 +110,17 @@ def get_slurm_nodes(exclude_re=None, ssh_host=None):
                      len(excluded), exclude_re, ",".join(sorted(excluded)))
         nodes -= excluded
         gpu_nodes -= excluded
-    return sorted(nodes), sorted(gpu_nodes), states
+    return sorted(nodes), sorted(gpu_nodes), states, features
+
+
+def split_by_features(nodes, node_features, required):
+    """Return (with_feature, without_feature) lists, keeping node order.
+    A node qualifies if it has any of the required features."""
+    required = set(required)
+    keep, skip = [], []
+    for n in nodes:
+        (keep if node_features.get(n, set()) & required else skip).append(n)
+    return keep, skip
 
 
 def slurm_state_ok(node_states):

@@ -48,7 +48,8 @@ CLUSH_OPTS = ["-o", "-oConnectTimeout=3"]
 # (number of CPUs * MAX_LOAD_RATIO). Overridable with --max-load-ratio.
 MAX_LOAD_RATIO = 1.0
 
-# Only deploy to these OSes (/etc/os-release ID) at or above this major version.
+# Second safety net (after the Slurm feature filter, ec.REQUIRED_FEATURES), checked on the node itself: only deploy to these
+# OSes (/etc/os-release ID) at or above this major version.
 ALLOWED_OS_IDS = {"rhel", "rocky"}
 MIN_OS_MAJOR = 8
 
@@ -138,6 +139,11 @@ def main():
                         help="deployment state file (default: %s)" % STATE_FILE)
     parser.add_argument("--exclude", metavar="REGEX", default=None,
                         help="exclude nodes whose name matches this regex")
+    parser.add_argument("--feature", dest="features", action="append",
+                        metavar="FEATURE", default=None,
+                        help="only deploy to nodes with this Slurm feature; "
+                             "repeat to allow any of several (default: %s)"
+                             % ",".join(ec.REQUIRED_FEATURES))
     parser.add_argument("--max-load-ratio", type=float, default=MAX_LOAD_RATIO,
                         help="skip deployment if load1 > CPUs * ratio "
                              "(default: %s)" % MAX_LOAD_RATIO)
@@ -152,7 +158,7 @@ def main():
     logging.basicConfig(level=logging.INFO, format=ec.LOG_FORMAT, stream=sys.stdout)
 
     try:
-        slurm_nodes, gpu_nodes, node_states = ec.get_slurm_nodes(args.exclude)
+        slurm_nodes, gpu_nodes, node_states, node_features = ec.get_slurm_nodes(args.exclude)
     except RuntimeError as e:
         log.error("failed to query Slurm nodes: %s", e)
         return 1
@@ -162,6 +168,15 @@ def main():
     log.info("Slurm reports %d node(s), %d with GPUs",
              len(slurm_nodes), len(gpu_nodes))
     slurm_set = set(slurm_nodes)
+
+    required = args.features or ec.REQUIRED_FEATURES
+    slurm_nodes, skipped = ec.split_by_features(slurm_nodes, node_features, required)
+    if skipped:
+        log.info("skipping %d node(s) without feature %s: %s", len(skipped),
+                 "/".join(sorted(required)), ",".join(skipped))
+    gpu_nodes, _ = ec.split_by_features(gpu_nodes, node_features, required)
+    log.info("%d node(s) eligible for deployment (%d with GPUs)",
+             len(slurm_nodes), len(gpu_nodes))
 
     try:
         state, _existed = ec.load_json(args.state_file, {})

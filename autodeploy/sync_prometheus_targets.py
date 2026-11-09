@@ -14,18 +14,21 @@ on admin001); this script never needs clush/salt.
 
 On each run:
   1. Lists all nodes defined in Slurm (`scontrol -o show node`, locally or
-     over ssh with --slurm-ssh) and which have GPUs (gpu GRES).
-  2. ADD: for every Slurm node missing from a targets file, probes
+     over ssh with --slurm-ssh), which have GPUs (gpu GRES), and their
+     features. Only nodes with a required feature (default rocky8, see
+     --feature) are eligible to be targets; e.g. centos7 nodes are not.
+  2. ADD: for every eligible node missing from a targets file, probes
      http://<node>.inband:<port>/metrics and appends the node only if the
-     exporter answers. Nodes where the exporter was never deployed (e.g.
-     unsupported OS) therefore never become dead scrape targets.
-  3. REMOVE: drops entries for nodes that are no longer defined in Slurm.
+     exporter answers. Nodes where the exporter was never deployed
+     therefore never become dead scrape targets.
+  3. REMOVE: drops entries for nodes that are no longer defined in Slurm
+     or no longer have a required feature (e.g. centos7 nodes).
      Safety rails:
        - only "managed" entries are ever removed, i.e. nodes this script
          has seen in Slurm at least once. Hand-added non-Slurm targets
          (e.g. infrastructure servers in node_targets.yml) are left alone;
-       - a node must be missing from Slurm in --remove-after consecutive
-         runs (default 2) before it is removed;
+       - a node must be ineligible in --remove-after consecutive runs
+         (default 2) before it is removed;
        - if more than --max-remove nodes would be removed in a single run,
          no removals are done at all and the run fails, unless --force
          is given;
@@ -114,6 +117,11 @@ def main():
     parser.add_argument("--exclude", metavar="REGEX", default=None,
                         help="ignore Slurm nodes whose name matches this regex "
                              "(never added; existing entries are left alone)")
+    parser.add_argument("--feature", dest="features", action="append",
+                        metavar="FEATURE", default=None,
+                        help="only keep nodes with this Slurm feature in the "
+                             "targets; repeat to allow any of several "
+                             "(default: %s)" % ",".join(ec.REQUIRED_FEATURES))
     parser.add_argument("--no-probe", action="store_true",
                         help="add every Slurm node without checking that its "
                              "exporter answers")
@@ -139,7 +147,7 @@ def main():
         return 1
 
     try:
-        slurm_nodes, gpu_nodes, _states = ec.get_slurm_nodes(
+        slurm_nodes, gpu_nodes, _states, node_features = ec.get_slurm_nodes(
             args.exclude, ssh_host=args.slurm_ssh)
     except RuntimeError as e:
         log.error("failed to query Slurm nodes: %s", e)
@@ -150,6 +158,15 @@ def main():
     log.info("Slurm reports %d node(s), %d with GPUs", len(slurm_nodes), len(gpu_nodes))
     slurm_set = set(slurm_nodes)
     excluded_re = re.compile(args.exclude) if args.exclude else None
+
+    required = args.features or ec.REQUIRED_FEATURES
+    feature_label = "/".join(sorted(required))
+    slurm_nodes, no_feature = ec.split_by_features(slurm_nodes, node_features, required)
+    gpu_nodes, _ = ec.split_by_features(gpu_nodes, node_features, required)
+    if no_feature:
+        log.info("%d node(s) without feature %s are not kept as targets: %s",
+                 len(no_feature), feature_label, ",".join(no_feature))
+    eligible_set = set(slurm_nodes)
 
     try:
         state, _existed = ec.load_json(args.state_file, {})
@@ -175,8 +192,14 @@ def main():
     for (_p, _port, _g, _l, entries) in files.values():
         present_anywhere |= set(entries)
 
-    # Count consecutive runs each managed, still-listed node has been gone.
-    gone = (managed - slurm_set) & present_anywhere
+    def why_gone(node):
+        if node in slurm_set:
+            return "lacks Slurm feature %s" % feature_label
+        return "no longer in Slurm"
+
+    # Count consecutive runs each managed, still-listed node has been
+    # ineligible (left Slurm, or lost the required feature).
+    gone = (managed - eligible_set) & present_anywhere
     if excluded_re:
         gone = {n for n in gone if not excluded_re.search(n)}
     for node in list(missing_runs):
@@ -187,9 +210,9 @@ def main():
     removable = set() if args.no_remove else {
         n for n in gone if missing_runs[n] >= args.remove_after}
     for node in sorted(gone - removable):
-        log.warning("%s: no longer in Slurm (%d/%d runs) - %s", node,
+        log.warning("%s: %s (%d/%d runs) - %s", node, why_gone(node),
                     missing_runs[node], args.remove_after,
-                    "removal disabled" if args.no_remove else "will remove if still gone")
+                    "removal disabled" if args.no_remove else "will remove if still so")
 
     exit_code = 0
     if len(removable) > args.max_remove and not args.force:
@@ -223,8 +246,8 @@ def main():
             log.info("%s%s: add %s", "[dry-run] " if args.dry_run else "",
                      filename, ec.target_address(n, port))
         for n in to_remove:
-            log.info("%s%s: remove %s (no longer in Slurm)",
-                     "[dry-run] " if args.dry_run else "", filename, n)
+            log.info("%s%s: remove %s (%s)", "[dry-run] " if args.dry_run else "",
+                     filename, n, why_gone(n))
         if args.dry_run:
             continue
         try:

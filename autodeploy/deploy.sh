@@ -130,9 +130,13 @@ deploy_remote() {
     tar -C "$SRC_DIR" -cf - "${REMOTE_FILES[@]}" "${REMOTE_UNITS[@]}" \
         | ssh "${SSH_OPTS[@]}" "$PROM_HOST" tar -C "$stage" -xf -
 
-    # Remote side: everything below runs on the Prometheus server.
-    ssh "${SSH_OPTS[@]}" "$PROM_HOST" bash -s -- \
-        "$stage" "$INSTALL_DIR" "$UNIT_DIR" "$TARGETS_DIR" "$SLURM_SSH" "$CHECK" "$ENABLE" <<'REMOTE'
+    # Remote side: everything below runs on the Prometheus server. ssh joins
+    # its arguments into one string for the remote shell, so each argument
+    # is quoted here to survive that (an empty --slurm-ssh would vanish).
+    local remote_args
+    remote_args=$(printf '%q ' "$stage" "$INSTALL_DIR" "$UNIT_DIR" "$TARGETS_DIR" \
+        "$SLURM_SSH" "$CHECK" "$ENABLE")
+    ssh "${SSH_OPTS[@]}" "$PROM_HOST" "bash -s -- $remote_args" <<'REMOTE'
 set -euo pipefail
 stage=$1 install_dir=$2 unit_dir=$3 targets_dir=$4 slurm_ssh=$5 check=$6 enable=$7
 trap 'rm -rf "$stage"' EXIT

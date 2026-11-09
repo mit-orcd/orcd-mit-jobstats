@@ -47,7 +47,10 @@ if its `Gres` contains a `gpu` entry. Scrape addresses are
 
 Each run (4x daily by default):
 
-1. Lists all Slurm nodes.
+1. Lists all Slurm nodes and keeps only those with the Slurm node feature
+   `rocky8` (`sinfo -o "%N %f"`; `REQUIRED_FEATURES`, or `--feature`,
+   repeatable to allow several, e.g. `--feature rocky8 --feature rocky9`).
+   Nodes tagged e.g. `centos7` are skipped without being contacted.
 2. Drops nodes that are no longer in Slurm from the deployment state, so
    a node re-added later under the same name gets deployed again.
 3. For each exporter, takes nodes not yet marked deployed and probes the
@@ -58,9 +61,10 @@ Each run (4x daily by default):
    - **Slurm state** healthy — down, drained, failing, maintenance,
      powered off, rebooting, or not-responding nodes are retried next run;
    - **ssh** reachable via clush;
-   - **OS** RHEL/Rocky >= 8 (`ALLOWED_OS_IDS` / `MIN_OS_MAJOR`). Other
-     nodes are never deployed, so their exporters never answer and core025
-     never adds them as targets;
+   - **OS** RHEL/Rocky >= 8 (`ALLOWED_OS_IDS` / `MIN_OS_MAJOR`) — a second
+     check on the node itself, in case a Slurm feature is wrong. Nodes
+     failing either check are never deployed, so their exporters never
+     answer and core025 never adds them as targets;
    - **load** — 1-min load <= `CPUs * --max-load-ratio` (default 1.0).
 5. Deploys to ready nodes:
 
@@ -84,21 +88,26 @@ access to the exporter ports. If HTTP to the nodes is blocked, use
 Each run (hourly by default) edits the files in `/db/prometheus/targets`
 locally:
 
-1. Lists all Slurm nodes.
-2. **Add**: for each Slurm node missing from a targets file (GPU nodes only
+1. Lists all Slurm nodes. Only nodes with the feature `rocky8` (same rule
+   and `--feature` option as on admin001) are eligible to be targets.
+2. **Add**: for each eligible node missing from a targets file (GPU nodes only
    for `gpu_targets.yml`), probes the exporter port and appends
    `'<node>.inband:<port>'` only if the exporter answers. New nodes appear
    within about an hour of admin001 deploying them.
-3. **Remove**: drops entries for nodes that are no longer defined in Slurm.
-   Safety rails:
+3. **Remove**: drops entries for nodes that are no longer defined in Slurm,
+   or that are still in Slurm but lack the required feature (e.g. existing
+   `centos7` entries). Safety rails:
    - Only **managed** entries are removed — nodes this script has seen in
      Slurm at least once. Hand-added, non-Slurm targets (e.g. infrastructure
      servers in `node_targets.yml`) are never touched.
-   - A node must be missing from Slurm in `--remove-after` consecutive runs
+   - A node must be ineligible in `--remove-after` consecutive runs
      (default 2) before removal, so one bad Slurm query cannot drop it.
    - If more than `--max-remove` nodes (default 20) would be removed in one
      run, nothing is removed and the run fails. Use `--force` to confirm a
-     large decommission.
+     large decommission — including the first cleanup of existing centos7
+     entries if there are more than 20:
+     `sync_prometheus_targets.py --dry-run` (check the list), then
+     `sync_prometheus_targets.py --force` twice (the 2-run grace period).
    - An empty or failed Slurm query aborts the run.
 
    Nodes that are down or drained but still defined in Slurm are kept.
@@ -196,6 +205,7 @@ vcore001 over ssh. To switch:
 # admin001
 deploy_exporters.py --dry-run                # show what would be deployed
 deploy_exporters.py --exclude '^testnode'    # skip nodes by regex
+deploy_exporters.py --feature rocky8 --feature rocky9   # allowed OS features
 deploy_exporters.py --max-load-ratio 2.0     # allow busier nodes
 systemctl start exporter-deploy.service; journalctl -u exporter-deploy.service
 
