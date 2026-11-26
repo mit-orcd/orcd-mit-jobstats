@@ -3,6 +3,7 @@ import csv
 import datetime
 import gzip
 import json
+import math
 import os
 import subprocess
 import sys
@@ -87,8 +88,9 @@ class DetailedGpuMetric:
            total__value_gpus[1] is used later to determine whether
            or not a valid value was found. The error code is 1 when
            the metric is missing for a node (e.g., a job on nodes with
-           different types of GPUs). The values of the other nodes are
-           still collected so that they can be shown per GPU.
+           different types of GPUs) or for some of the GPUs of a node
+           (e.g., the value of a GPU was NaN). The values that were found
+           are still collected so that they can be shown per GPU.
         """
         overall = 0
         overall_gpu_count = 0
@@ -102,6 +104,9 @@ class DetailedGpuMetric:
                     overall += value
                     overall_gpu_count += 1
                     self.node_value_index.append((n, value, g))
+                node_gpus = d.get("gpu_utilization") or d.get("gpu_total_memory") or {}
+                if not self.is_mig and any(g not in d[self.name_ss] for g in node_gpus):
+                    self.error_code = 1
             else:
                 if self.is_mig:
                     self.node_value_index.append((n, None, "#"))
@@ -469,12 +474,23 @@ class Jobstats:
                     v = i['value'][1]
                 if 'values' in i:
                     v = i['values'][0][0]
+                # Prometheus returns "NaN", "+Inf" or "-Inf" when a value is
+                # not a number (e.g., the exporter reported NaN for a detailed
+                # GPU metric that the GPU could not measure). Leave such a
+                # value out so that it is handled like a missing one.
+                try:
+                    x = float(v)
+                except ValueError:
+                    x = float("nan")
+                if not math.isfinite(x):
+                    gpu = "" if minor is None else f" (GPU {minor})"
+                    self.debug_print(f"ignoring value {v} of {n} for {node}{gpu}")
+                    continue
                 # trim unneeded precision. Values below 1 keep three decimals
                 # since the detailed GPU metrics are fractions (0.643 is 64.3%).
                 # Upstream only does this below 0.1 which limits those metrics
                 # to steps of 10%.
-                if '.' in v:
-                    x = float(v)
+                if '.' in v or 'e' in v.lower():
                     if x >= 1:
                         v = round(x, 1)
                     else:
@@ -599,7 +615,10 @@ class Jobstats:
             metrics["power_usage_milliwatts"]  = "DCGM_FI_DEV_POWER_USAGE"
         if metric not in metrics:
             self.error(f"{metric} is not valid for exporter {c.GPU_METRICS_EXPORTER}.")
-        return Jobstats.gpu_query_string(op, metrics[metric] + "<sel>")
+        # ">= 0" drops the samples that are NaN (none of these metrics can be
+        # negative). The exporter now and then reports NaN for a metric and a
+        # single NaN sample would turn the average over the whole job into NaN.
+        return Jobstats.gpu_query_string(op, metrics[metric] + "<sel> >= 0")
 
     # Query Prometheus for the job. With no arguments all of the metrics are
     # fetched, otherwise only the named ones (e.g., "used_memory", "cpus",
@@ -768,7 +787,8 @@ class Jobstats:
             self.gpu_mem_error_code = 0
             self.gpu_mem__node_used_total_index = []
             for n, d in sp_node.items():
-                if 'gpu_used_memory' in d and 'gpu_total_memory' in d:
+                if 'gpu_used_memory' in d and 'gpu_total_memory' in d \
+                   and all(g in d['gpu_used_memory'] for g in d['gpu_total_memory']):
                     gpus = sorted(d['gpu_total_memory'].keys())
                     for g in gpus:
                         used  = d['gpu_used_memory'][g]
