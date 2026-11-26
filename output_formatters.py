@@ -540,9 +540,9 @@ class ClassicOutput(BaseFormatter):
             report += f"\n{gutter}Detailed GPU Metrics\n"
             report += "\n\n".join(tables) + "\n"
             if docs_url:
-                # align the URL with the left edge of the table
+                # a blank line, then the URL aligned with the left edge of the table
                 rule = tables[0].split("\n")[0]
-                report += " " * (len(rule) - len(rule.lstrip())) + docs_url + "\n"
+                report += "\n" + " " * (len(rule) - len(rule.lstrip())) + docs_url + "\n"
         else:
             # display metrics as lines of text
             for gm in shown:

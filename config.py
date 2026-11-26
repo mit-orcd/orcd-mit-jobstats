@@ -4,7 +4,7 @@
 
 # prometheus server address and port
 # PROM_SERVER = "http://admin001.inband:9090"
-PROM_SERVER = "http://vcore001.inband:9090"
+PROM_SERVER = "http://core025.inband:9090"
 
 # Number of days that Prometheus keeps the data. It is only used by notes that
 # call self.js.is_retained() (e.g., to show a URL only while the data exists).
@@ -91,7 +91,7 @@ SLURM_ARCHIVE_CONF = "/home/systems/slurm/archive/etc/slurm"
 ################################################################################
 GPU_METRICS_EXPORTER = "NVML"  # choices are "None" or "NVML" (or "DCGM")
 # URL shown below the metrics to explain them (use "" for none)
-GPU_METRICS_DOCS_URL = "https://orcd-docs.mit.edu/running-jobs/overview/#retrieving-job-stats/"
+GPU_METRICS_DOCS_URL = "https://orcd-docs.mit.edu/running-jobs/application-analysis/#jobstats/"
 GPU_METRICS = {}
 GPU_METRICS["SM"] = {"metric": "sm_util_percent",
                      "operation": "avg_over_time",
