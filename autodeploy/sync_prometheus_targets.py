@@ -15,14 +15,15 @@ on admin001); this script never needs clush/salt.
 On each run:
   1. Lists all nodes defined in Slurm (`scontrol -o show node`, locally or
      over ssh with --slurm-ssh), which have GPUs (gpu GRES), and their
-     features. Only nodes with a required feature (default rocky8, see
-     --feature) are eligible to be targets; e.g. centos7 nodes are not.
+     features. Nodes with an excluded feature (default centos7, see
+     --exclude-feature) are not eligible to be targets; every other node
+     is, including nodes with no features.
   2. ADD: for every eligible node missing from a targets file, probes
      http://<node>.inband:<port>/metrics and appends the node only if the
      exporter answers. Nodes where the exporter was never deployed
      therefore never become dead scrape targets.
   3. REMOVE: drops entries for nodes that are no longer defined in Slurm
-     or no longer have a required feature (e.g. centos7 nodes).
+     or that have an excluded feature (e.g. centos7 nodes).
      Safety rails:
        - only "managed" entries are ever removed: nodes this script has
          seen in Slurm at least once, or whose name matches --node-pattern
@@ -124,11 +125,12 @@ def main():
     parser.add_argument("--exclude", metavar="REGEX", default=None,
                         help="ignore Slurm nodes whose name matches this regex "
                              "(never added; existing entries are left alone)")
-    parser.add_argument("--feature", dest="features", action="append",
-                        metavar="FEATURE", default=None,
-                        help="only keep nodes with this Slurm feature in the "
-                             "targets; repeat to allow any of several "
-                             "(default: %s)" % ",".join(ec.REQUIRED_FEATURES))
+    parser.add_argument("--exclude-feature", dest="exclude_features",
+                        action="append", metavar="FEATURE", default=None,
+                        help="keep nodes with this Slurm feature out of the "
+                             "targets; repeat to exclude several, '' to "
+                             "exclude none (default: %s)"
+                             % ",".join(ec.EXCLUDED_FEATURES))
     parser.add_argument("--node-pattern", metavar="REGEX", default=NODE_NAME_PATTERN,
                         help="target names matching this are treated as Slurm "
                              "compute nodes and removed when not in Slurm, even "
@@ -171,17 +173,18 @@ def main():
     slurm_set = set(slurm_nodes)
     excluded_re = re.compile(args.exclude) if args.exclude else None
 
-    required = args.features or ec.REQUIRED_FEATURES
-    feature_label = "/".join(sorted(required))
-    slurm_nodes, no_feature = ec.split_by_features(slurm_nodes, node_features, required)
-    gpu_nodes, _ = ec.split_by_features(gpu_nodes, node_features, required)
+    excluded_features = ec.excluded_features(args.exclude_features)
+    feature_label = "/".join(sorted(excluded_features))
+    slurm_nodes, by_feature = ec.split_by_features(slurm_nodes, node_features,
+                                                   excluded_features)
+    gpu_nodes, _ = ec.split_by_features(gpu_nodes, node_features, excluded_features)
     if not slurm_nodes:
-        log.error("no Slurm node has feature %s (check `sinfo -o \"%%N %%f\"` "
-                  "or --feature); refusing to continue", feature_label)
+        log.error("every Slurm node has feature %s (check `sinfo -o \"%%N %%f\"` "
+                  "or --exclude-feature); refusing to continue", feature_label)
         return 1
-    if no_feature:
-        log.info("%d node(s) without feature %s are not kept as targets: %s",
-                 len(no_feature), feature_label, ",".join(no_feature))
+    if by_feature:
+        log.info("%d node(s) with feature %s are not kept as targets: %s",
+                 len(by_feature), feature_label, ",".join(by_feature))
     eligible_set = set(slurm_nodes)
 
     try:
@@ -221,11 +224,11 @@ def main():
 
     def why_gone(node):
         if node in slurm_set:
-            return "lacks Slurm feature %s" % feature_label
+            return "has Slurm feature %s" % feature_label
         return "no longer in Slurm"
 
     # Count consecutive runs each managed, still-listed node has been
-    # ineligible (left Slurm, or lost the required feature).
+    # ineligible (left Slurm, or has an excluded feature).
     gone = (managed - eligible_set) & present_anywhere
     if excluded_re:
         gone = {n for n in gone if not excluded_re.search(n)}

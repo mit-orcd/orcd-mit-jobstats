@@ -30,11 +30,12 @@ EXPORTERS = {
 # Suffix appended to the Slurm node name to build the scrape address.
 NODE_SUFFIX = ".inband"
 
-# Only nodes with at least one of these Slurm node features (`sinfo -o %f`)
-# get exporters deployed and appear in the Prometheus target files; nodes
-# tagged e.g. centos7 are skipped by deployment and removed from targets.
-# Both scripts accept --feature (repeatable) to override.
-REQUIRED_FEATURES = ["rocky8"]
+# Nodes with any of these Slurm node features (`sinfo -o %f`) are left out:
+# no exporters are deployed to them and they are removed from the Prometheus
+# target files. Every other node is eligible, including nodes with no
+# features at all. Both scripts accept --exclude-feature (repeatable) to
+# override.
+EXCLUDED_FEATURES = ["centos7"]
 
 # Slurm node states (scontrol State=, '+'-separated flags) that mean
 # "don't touch this node now".
@@ -71,7 +72,8 @@ def get_slurm_nodes(exclude_re=None, ssh_host=None):
     including nodes not in any partition (sinfo would miss those).
     all_nodes/gpu_nodes are sorted lists; states maps node -> set of
     state flags (e.g. {'IDLE', 'DRAIN'}); features maps node -> set of
-    available node features (same as `sinfo -o %f`, e.g. {'rocky8'}).
+    available node features (same as `sinfo -o %f`, e.g. {'rocky8'}; empty
+    if the node has none).
     If ssh_host is set, scontrol runs there over ssh (for hosts without
     a Slurm client).
 
@@ -113,13 +115,23 @@ def get_slurm_nodes(exclude_re=None, ssh_host=None):
     return sorted(nodes), sorted(gpu_nodes), states, features
 
 
-def split_by_features(nodes, node_features, required):
-    """Return (with_feature, without_feature) lists, keeping node order.
-    A node qualifies if it has any of the required features."""
-    required = set(required)
+def excluded_features(cli_features):
+    """Return the set of excluded features (lower case): the --exclude-feature
+    values if any were given, else EXCLUDED_FEATURES. Empty names are
+    dropped, so --exclude-feature '' excludes nothing."""
+    names = EXCLUDED_FEATURES if cli_features is None else cli_features
+    return {f.lower() for f in names if f}
+
+
+def split_by_features(nodes, node_features, excluded):
+    """Return (eligible, excluded_nodes) lists, keeping node order. A node
+    is excluded if it has any of the excluded features (compared without
+    regard to case). Nodes with no features are eligible."""
+    excluded = {f.lower() for f in excluded}
     keep, skip = [], []
     for n in nodes:
-        (keep if node_features.get(n, set()) & required else skip).append(n)
+        features = {f.lower() for f in node_features.get(n, set())}
+        (skip if features & excluded else keep).append(n)
     return keep, skip
 
 

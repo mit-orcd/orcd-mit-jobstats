@@ -47,10 +47,12 @@ if its `Gres` contains a `gpu` entry. Scrape addresses are
 
 Each run (4x daily by default):
 
-1. Lists all Slurm nodes and keeps only those with the Slurm node feature
-   `rocky8` (`sinfo -o "%N %f"`; `REQUIRED_FEATURES`, or `--feature`,
-   repeatable to allow several, e.g. `--feature rocky8 --feature rocky9`).
-   Nodes tagged e.g. `centos7` are skipped without being contacted.
+1. Lists all Slurm nodes and leaves out those with the Slurm node feature
+   `centos7` (`sinfo -o "%N %f"`; `EXCLUDED_FEATURES`, or `--exclude-feature`,
+   repeatable to exclude several, e.g.
+   `--exclude-feature centos7 --exclude-feature ubuntu22`). They are skipped
+   without being contacted. Every other node is eligible, including nodes
+   with no features at all. The match ignores case.
 2. Drops nodes that are no longer in Slurm from the deployment state, so
    a node re-added later under the same name gets deployed again.
 3. For each exporter, takes nodes not yet marked deployed and probes the
@@ -62,7 +64,8 @@ Each run (4x daily by default):
      powered off, rebooting, or not-responding nodes are retried next run;
    - **ssh** reachable via clush;
    - **OS** RHEL/Rocky >= 8 (`ALLOWED_OS_IDS` / `MIN_OS_MAJOR`) — a second
-     check on the node itself, in case a Slurm feature is wrong. Nodes
+     check on the node itself, e.g. for a CentOS 7 node that is not tagged
+     `centos7` in Slurm. Nodes
      failing either check are never deployed, so their exporters never
      answer and core025 never adds them as targets;
    - **load** — 1-min load <= `CPUs * --max-load-ratio` (default 1.0).
@@ -88,14 +91,15 @@ access to the exporter ports. If HTTP to the nodes is blocked, use
 Each run (hourly by default) edits the files in `/db/prometheus/targets`
 locally:
 
-1. Lists all Slurm nodes. Only nodes with the feature `rocky8` (same rule
-   and `--feature` option as on admin001) are eligible to be targets.
+1. Lists all Slurm nodes. Nodes with the feature `centos7` (same rule and
+   `--exclude-feature` option as on admin001) are not eligible to be
+   targets; every other node is.
 2. **Add**: for each eligible node missing from a targets file (GPU nodes only
    for `gpu_targets.yml`), probes the exporter port and appends
    `'<node>.inband:<port>'` only if the exporter answers. New nodes appear
    within about an hour of admin001 deploying them.
 3. **Remove**: drops entries for nodes that are no longer defined in Slurm,
-   or that are still in Slurm but lack the required feature (e.g. existing
+   or that are still in Slurm but have an excluded feature (e.g. existing
    `centos7` entries). Safety rails:
    - Only **managed** entries are removed: nodes this script has seen in
      Slurm at least once, or whose name matches `--node-pattern` (default
@@ -208,7 +212,7 @@ vcore001 over ssh. To switch:
 # admin001
 deploy_exporters.py --dry-run                # show what would be deployed
 deploy_exporters.py --exclude '^testnode'    # skip nodes by regex
-deploy_exporters.py --feature rocky8 --feature rocky9   # allowed OS features
+deploy_exporters.py --exclude-feature centos7 --exclude-feature ubuntu22   # excluded features
 deploy_exporters.py --max-load-ratio 2.0     # allow busier nodes
 systemctl start exporter-deploy.service; journalctl -u exporter-deploy.service
 

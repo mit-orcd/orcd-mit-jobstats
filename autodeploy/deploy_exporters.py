@@ -9,7 +9,9 @@ sync_prometheus_targets.py, which adds a node once its exporter answers.
 
 On each run:
   1. Lists all nodes defined in Slurm (`scontrol -o show node`) and which
-     of them have GPUs (gpu GRES).
+     of them have GPUs (gpu GRES). Nodes with an excluded Slurm feature
+     (default centos7, see --exclude-feature) are skipped without being
+     contacted; every other node is eligible.
   2. Forgets nodes that are no longer in Slurm from the deployment state,
      so a node re-added later under the same name is deployed again.
   3. For each exporter (cgroup + node on all nodes, nvidia-gpu on GPU
@@ -48,8 +50,10 @@ CLUSH_OPTS = ["-o", "-oConnectTimeout=3"]
 # (number of CPUs * MAX_LOAD_RATIO). Overridable with --max-load-ratio.
 MAX_LOAD_RATIO = 1.0
 
-# Second safety net (after the Slurm feature filter, ec.REQUIRED_FEATURES), checked on the node itself: only deploy to these
-# OSes (/etc/os-release ID) at or above this major version.
+# Second safety net (after the Slurm feature filter, ec.EXCLUDED_FEATURES),
+# checked on the node itself: only deploy to these OSes (/etc/os-release ID)
+# at or above this major version. It catches e.g. a CentOS 7 node that is
+# not tagged centos7 in Slurm.
 ALLOWED_OS_IDS = {"rhel", "rocky"}
 MIN_OS_MAJOR = 8
 
@@ -139,11 +143,11 @@ def main():
                         help="deployment state file (default: %s)" % STATE_FILE)
     parser.add_argument("--exclude", metavar="REGEX", default=None,
                         help="exclude nodes whose name matches this regex")
-    parser.add_argument("--feature", dest="features", action="append",
-                        metavar="FEATURE", default=None,
-                        help="only deploy to nodes with this Slurm feature; "
-                             "repeat to allow any of several (default: %s)"
-                             % ",".join(ec.REQUIRED_FEATURES))
+    parser.add_argument("--exclude-feature", dest="exclude_features",
+                        action="append", metavar="FEATURE", default=None,
+                        help="don't deploy to nodes with this Slurm feature; "
+                             "repeat to exclude several, '' to exclude none "
+                             "(default: %s)" % ",".join(ec.EXCLUDED_FEATURES))
     parser.add_argument("--max-load-ratio", type=float, default=MAX_LOAD_RATIO,
                         help="skip deployment if load1 > CPUs * ratio "
                              "(default: %s)" % MAX_LOAD_RATIO)
@@ -169,12 +173,13 @@ def main():
              len(slurm_nodes), len(gpu_nodes))
     slurm_set = set(slurm_nodes)
 
-    required = args.features or ec.REQUIRED_FEATURES
-    slurm_nodes, skipped = ec.split_by_features(slurm_nodes, node_features, required)
+    excluded_features = ec.excluded_features(args.exclude_features)
+    slurm_nodes, skipped = ec.split_by_features(slurm_nodes, node_features,
+                                                excluded_features)
     if skipped:
-        log.info("skipping %d node(s) without feature %s: %s", len(skipped),
-                 "/".join(sorted(required)), ",".join(skipped))
-    gpu_nodes, _ = ec.split_by_features(gpu_nodes, node_features, required)
+        log.info("skipping %d node(s) with feature %s: %s", len(skipped),
+                 "/".join(sorted(excluded_features)), ",".join(skipped))
+    gpu_nodes, _ = ec.split_by_features(gpu_nodes, node_features, excluded_features)
     log.info("%d node(s) eligible for deployment (%d with GPUs)",
              len(slurm_nodes), len(gpu_nodes))
 
